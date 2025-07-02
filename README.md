@@ -54,59 +54,184 @@ private async Task AddReportEventsAndSubscriptionsAsync(int reportKey, IEnumerab
     const string userName = "system";
     if (eventRequests == null || !eventRequests.Any()) return;
 
-    // Step 1: Process Events
-    var dbEventEntities = await _context.PbiReportEventTypes
+    var now = DateTime.UtcNow;
+
+    var existingEventTypes = await GetExistingEventTypesAsync(reportKey);
+    var (newEvents, updatedEvents, deletedEvents, eventKeyMap) = UpsertEventTypes(eventRequests, existingEventTypes, reportKey, userName, now);
+
+    _context.PbiReportEventTypes.AddRange(newEvents);
+    _context.PbiReportEventTypes.UpdateRange(updatedEvents);
+    _context.PbiReportEventTypes.RemoveRange(deletedEvents);
+
+    await SaveChangesSafelyAsync("events");
+
+    var existingSubscriptions = await GetExistingSubscriptionsAsync(reportKey);
+    var (newSubs, updatedSubs, deletedSubs) = UpsertSubscriptions(eventRequests, existingSubscriptions, eventKeyMap, reportKey, userName, now);
+
+    _context.PbiReportSubscription.AddRange(newSubs);
+    _context.PbiReportSubscription.UpdateRange(updatedSubs);
+    _context.PbiReportSubscription.RemoveRange(deletedSubs);
+
+    await SaveChangesSafelyAsync("subscriptions");
+}
+
+private Task<List<PbiReportEventTypes>> GetExistingEventTypesAsync(int reportKey)
+{
+    return _context.PbiReportEventTypes
         .Where(e => e.ReportKey == reportKey)
         .ToListAsync();
-
-    var incomingEventEntities = MapToEventEntities(reportKey, eventRequests, userName);
-    await SyncEventTypesAsync(dbEventEntities, incomingEventEntities);
-
-    // Step 2: Process Subscriptions
-    var dbSubscriptions = await _context.PbiReportSubscription
-        .Where(s => s.ReportKey == reportKey)
-        .ToListAsync();
-
-    var incomingSubscriptions = MapToSubscriptionEntities(reportKey, incomingEventEntities, eventRequests, userName);
-    await SyncSubscriptionsAsync(dbSubscriptions, incomingSubscriptions);
 }
 
-private List<PbiReportEventTypes> MapToEventEntities(int reportKey, IEnumerable<PbiReportEventRequest> requests, string userName)
+private (List<PbiReportEventTypes> newEvents,
+         List<PbiReportEventTypes> updatedEvents,
+         List<PbiReportEventTypes> deletedEvents,
+         Dictionary<(int, int), int> eventKeyMap)
+UpsertEventTypes(IEnumerable<PbiReportEventRequest> requests,
+                 List<PbiReportEventTypes> existing,
+                 int reportKey,
+                 string userName,
+                 DateTime now)
 {
-    return requests.Select(req => new PbiReportEventTypes
-    {
-        ReportEventKey = req.ReportEventKey, // 0 if new
-        ReportKey = reportKey,
-        EventTypeKey = req.EventTypeKey,
-        EventNodeId = req.Nodes?.FirstOrDefault()?.EventNodeId,
-        EventNodeName = req.Nodes?.FirstOrDefault()?.EventNodeName,
-        CreatedAt = DateTime.UtcNow,
-        CreatedBy = userName
-    }).ToList();
-}
-
-private List<PbiReportSubscription> MapToSubscriptionEntities(
-    int reportKey,
-    List<PbiReportEventTypes> eventEntities,
-    IEnumerable<PbiReportEventRequest> requests,
-    string userName)
-{
-    var subscriptions = new List<PbiReportSubscription>();
+    var seenKeys = new HashSet<(int, int)>();
+    var newList = new List<PbiReportEventTypes>();
+    var updatedList = new List<PbiReportEventTypes>();
 
     foreach (var req in requests)
     {
-        if (req.Subscription != null)
+        var key = (reportKey, req.EventTypeKey);
+        seenKeys.Add(key);
+
+        var match = existing.FirstOrDefault(e => e.ReportKey == reportKey && e.EventTypeKey == req.EventTypeKey);
+
+        var newNode = req.Nodes?.FirstOrDefault();
+
+        if (match != null)
         {
-            var eventEntity = eventEntities.FirstOrDefault(e =>
-                e.EventTypeKey == req.EventTypeKey &&
-                e.EventNodeId == req.Nodes?.FirstOrDefault()?.EventNodeId);
+            bool updated = false;
+            if (match.NodeId != newNode?.EventNodeId)
+            {
+                match.NodeId = newNode?.EventNodeId;
+                updated = true;
+            }
 
-            if (eventEntity == null) continue;
+            if (match.EventNodeName != newNode?.EventNodeName)
+            {
+                match.EventNodeName = newNode?.EventNodeName;
+                updated = true;
+            }
 
-            subscriptions.Add(new PbiReportSubscription
+            if (updated)
+                updatedList.Add(match);
+        }
+        else
+        {
+            newList.Add(new PbiReportEventTypes
             {
                 ReportKey = reportKey,
-                ReportEventKey = eventEntity.ReportEventKey,
+                EventTypeKey = req.EventTypeKey,
+                NodeId = newNode?.EventNodeId,
+                EventNodeName = newNode?.EventNodeName,
+                CreatedAt = now,
+                CreatedBy = userName
+            });
+        }
+    }
+
+    var toDelete = existing
+        .Where(e => !seenKeys.Contains((e.ReportKey, e.EventTypeKey)))
+        .ToList();
+
+    var map = existing.Concat(newList)
+        .ToDictionary(e => (e.ReportKey, e.EventTypeKey), e => e.ReportEventKey);
+
+    return (newList, updatedList, toDelete, map);
+}
+
+private Task<List<PbiReportSubscription>> GetExistingSubscriptionsAsync(int reportKey)
+{
+    return _context.PbiReportSubscription
+        .Where(s => s.ReportKey == reportKey)
+        .ToListAsync();
+}
+
+private (List<PbiReportSubscription> newSubs,
+         List<PbiReportSubscription> updatedSubs,
+         List<PbiReportSubscription> deletedSubs)
+UpsertSubscriptions(IEnumerable<PbiReportEventRequest> requests,
+                    List<PbiReportSubscription> existing,
+                    Dictionary<(int, int), int> eventKeyMap,
+                    int reportKey,
+                    string userName,
+                    DateTime now)
+{
+    var seenSubKeys = new HashSet<int>();
+    var newList = new List<PbiReportSubscription>();
+    var updatedList = new List<PbiReportSubscription>();
+
+    foreach (var req in requests)
+    {
+        if (req.Subscription == null)
+            continue;
+
+        var key = (reportKey, req.EventTypeKey);
+        if (!eventKeyMap.TryGetValue(key, out int reportEventKey))
+            continue;
+
+        seenSubKeys.Add(reportEventKey);
+
+        var existingSub = existing.FirstOrDefault(s => s.ReportEventKey == reportEventKey);
+        if (existingSub != null)
+        {
+            bool updated = false;
+
+            if (existingSub.ReportDeliveryModeKey != req.Subscription.ReportDeliveryModeKey)
+            {
+                existingSub.ReportDeliveryModeKey = req.Subscription.ReportDeliveryModeKey;
+                updated = true;
+            }
+
+            if (existingSub.ReportDeliveryFormatKey != req.Subscription.ReportDeliveryFormatKey)
+            {
+                existingSub.ReportDeliveryFormatKey = req.Subscription.ReportDeliveryFormatKey;
+                updated = true;
+            }
+
+            if (existingSub.FileShareLocation != req.Subscription.FileShareLocation)
+            {
+                existingSub.FileShareLocation = req.Subscription.FileShareLocation;
+                updated = true;
+            }
+
+            if (existingSub.EmailTo != req.Subscription.EmailTo)
+            {
+                existingSub.EmailTo = req.Subscription.EmailTo;
+                updated = true;
+            }
+
+            if (existingSub.EmailCC != req.Subscription.EmailCC)
+            {
+                existingSub.EmailCC = req.Subscription.EmailCC;
+                updated = true;
+            }
+
+            if (existingSub.EmailSubject != req.Subscription.EmailSubject)
+            {
+                existingSub.EmailSubject = req.Subscription.EmailSubject;
+                updated = true;
+            }
+
+            if (updated)
+            {
+                existingSub.IsActive = true;
+                updatedList.Add(existingSub);
+            }
+        }
+        else
+        {
+            newList.Add(new PbiReportSubscription
+            {
+                ReportKey = reportKey,
+                ReportEventKey = reportEventKey,
                 ReportDeliveryModeKey = req.Subscription.ReportDeliveryModeKey,
                 ReportDeliveryFormatKey = req.Subscription.ReportDeliveryFormatKey,
                 FileShareLocation = req.Subscription.FileShareLocation,
@@ -114,69 +239,28 @@ private List<PbiReportSubscription> MapToSubscriptionEntities(
                 EmailCC = req.Subscription.EmailCC,
                 EmailSubject = req.Subscription.EmailSubject,
                 IsActive = true,
-                CreatedAt = DateTime.UtcNow,
+                CreatedAt = now,
                 CreatedBy = userName
             });
         }
     }
 
-    return subscriptions;
+    var toDelete = existing
+        .Where(s => !seenSubKeys.Contains(s.ReportEventKey))
+        .ToList();
+
+    return (newList, updatedList, toDelete);
 }
 
-private async Task SyncEventTypesAsync(List<PbiReportEventTypes> dbEvents, List<PbiReportEventTypes> incoming)
+private async Task SaveChangesSafelyAsync(string context)
 {
-    var toAdd = incoming.Where(i => i.ReportEventKey == 0).ToList();
-
-    var toUpdate = dbEvents.Where(db => incoming.Any(i => i.ReportEventKey == db.ReportEventKey &&
-        (i.EventTypeKey != db.EventTypeKey ||
-         i.EventNodeId != db.EventNodeId ||
-         i.EventNodeName != db.EventNodeName))).ToList();
-
-    var incomingKeys = incoming.Select(i => i.ReportEventKey).ToList();
-    var toDelete = dbEvents.Where(db => !incomingKeys.Contains(db.ReportEventKey)).ToList();
-
-    _context.PbiReportEventTypes.AddRange(toAdd);
-    _context.PbiReportEventTypes.UpdateRange(toUpdate);
-    _context.PbiReportEventTypes.RemoveRange(toDelete);
-
     try
     {
         await _context.SaveChangesAsync();
     }
     catch (Exception ex)
     {
-        // Log or handle the exception as needed
-        Console.WriteLine($"Error saving event types: {ex.Message}");
+        Console.WriteLine($"Error saving changes for {context}: {ex}");
         throw;
     }
 }
-
-private async Task SyncSubscriptionsAsync(List<PbiReportSubscription> dbSubs, List<PbiReportSubscription> incoming)
-{
-    var toAdd = incoming.Where(i => !dbSubs.Any(d => d.ReportEventKey == i.ReportEventKey)).ToList();
-
-    var toUpdate = dbSubs.Where(d => incoming.Any(i => i.ReportEventKey == d.ReportEventKey &&
-        (i.EmailTo != d.EmailTo ||
-         i.EmailCC != d.EmailCC ||
-         i.EmailSubject != d.EmailSubject ||
-         i.FileShareLocation != d.FileShareLocation))).ToList();
-
-    var incomingKeys = incoming.Select(i => i.ReportEventKey).ToList();
-    var toDelete = dbSubs.Where(d => !incomingKeys.Contains(d.ReportEventKey)).ToList();
-
-    _context.PbiReportSubscription.AddRange(toAdd);
-    _context.PbiReportSubscription.UpdateRange(toUpdate);
-    _context.PbiReportSubscription.RemoveRange(toDelete);
-
-    try
-    {
-        await _context.SaveChangesAsync();
-    }
-    catch (Exception ex)
-    {
-        // Log or handle the exception as needed
-        Console.WriteLine($"Error saving subscriptions: {ex.Message}");
-        throw;
-    }
-}
-
