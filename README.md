@@ -1,47 +1,82 @@
+private async Task AddReportEventsAndSubscriptionsAsync(int reportKey, IEnumerable<PbiReportEventRequest> eventRequests)
 {
-  "reportKey": 24,
-  "reportName": "edit_Sales",
-  "reportDescription": "edit_Quarterly sales breakdown",
-  "commentary": "edit_Reviewed by finance team",
-  "workSpaceKey": 3,
-  "approvedBy": "edit_john.doe@company.com",
-  "reportStatus": "edit_Approved",
-  "reportStatusName": "edit_Final Approval",
-  "reportDatasets": [101, 102],
-  "eventTypes": [
+    const string userName = "system";
+
+    if (eventRequests == null || !eventRequests.Any())
+        return;
+
+    // ✔ Materialize old event keys to avoid open DataReader issue
+    var oldEventKeys = _context.PbiReportEventTypes
+        .Where(e => e.ReportKey == reportKey)
+        .Select(e => e.ReportEventKey)
+        .ToList(); // ✔
+
+    var oldSubscriptions = _context.PbiReportSubscription
+        .Where(s => oldEventKeys.Contains(s.ReportEventKey))
+        .ToList(); // ✔
+    
+    _context.PbiReportSubscription.RemoveRange(oldSubscriptions);
+
+    var oldEvents = _context.PbiReportEventTypes
+        .Where(e => e.ReportKey == reportKey)
+        .ToList(); // ✔
+
+    _context.PbiReportEventTypes.RemoveRange(oldEvents);
+
+    try
     {
-      "eventTypeKey": 1,
-      "nodes": [
-        {
-          "eventNodeId": "201",
-          "eventNodeName": "edit_North Region"
-        }
-      ],
-      "subscription": {
-        "reportDeliveryModeKey": 1,
-        "reportDeliveryFormatKey": 2,
-        "fileShareLocation": "\\\\fileshare\\reports\\q2",
-        "emailTo": "edit_sales@company.com",
-        "emailCC": "edit_manager@company.com",
-        "emailSubject": "edit_Q2 Sales Report"
-      }
-    },
-    {
-      "eventTypeKey": 2,
-      "nodes": [
-        {
-          "eventNodeId": "202",
-          "eventNodeName": "edit_South Region"
-        }
-      ],
-      "subscription": {
-        "reportDeliveryModeKey": 2,
-        "reportDeliveryFormatKey": 1,
-        "fileShareLocation": null,
-        "emailTo": "edit_south.sales@company.com",
-        "emailCC": null,
-        "emailSubject": "edit_South Region Q2 Report"
-      }
+        await _context.SaveChangesAsync(); // ✔ Safe now
     }
-  ]
+    catch (Exception e)
+    {
+        Console.WriteLine(e);
+        throw;
+    }
+
+    // Add new events and subscriptions
+    foreach (var eventReq in eventRequests)
+    {
+        var eventEntity = new PbiReportEventTypes
+        {
+            ReportKey = reportKey,
+            EventTypeKey = eventReq.EventTypeKey,
+            NodeId = eventReq.Nodes?.FirstOrDefault()?.EventNodeId,
+            EventNodeName = eventReq.Nodes?.FirstOrDefault()?.EventNodeName,
+            CreatedAt = DateTime.UtcNow,
+            CreatedBy = userName
+        };
+
+        _context.PbiReportEventTypes.Add(eventEntity);
+
+        try
+        {
+            await _context.SaveChangesAsync(); // ✔ Save each eventEntity to get ReportEventKey for FK
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine(e);
+            throw;
+        }
+
+        if (eventReq.Subscription != null)
+        {
+            var subscription = new PbiReportSubscription
+            {
+                ReportKey = reportKey,
+                ReportEventKey = eventEntity.ReportEventKey,
+                ReportDeliveryModeKey = eventReq.Subscription.ReportDeliveryModeKey,
+                ReportDeliveryFormatKey = eventReq.Subscription.ReportDeliveryFormatKey,
+                FileShareLocation = eventReq.Subscription.FileShareLocation,
+                EmailTo = eventReq.Subscription.EmailTo,
+                EmailCC = eventReq.Subscription.EmailCC,
+                EmailSubject = eventReq.Subscription.EmailSubject,
+                IsActive = true,
+                CreatedAt = DateTime.UtcNow,
+                CreatedBy = userName
+            };
+
+            _context.PbiReportSubscription.Add(subscription);
+            await _context.SaveChangesAsync(); // ✔ Save each subscription
+        }
+    }
 }
