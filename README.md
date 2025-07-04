@@ -1,3 +1,27 @@
+# 1. Stash your changes (safely stores them)
+git stash
+
+# 2. Switch to the development branch
+git checkout development
+
+# 3. Pull the latest changes
+git pull origin development
+
+# 4. Create a new feature branch from updated development
+git checkout -b feature/pbi-report-v2
+
+# 5. Apply the stashed changes (without deleting them)
+git stash apply
+
+# (Optional) After verifying changes applied successfully and everything looks good:
+git stash drop
+# or if you're fully confident:
+# git stash clear  # to remove all stashes
+
+
+
+
+
 {
   "reportKey": 24,
   "reportName": "prefix_Sales",
